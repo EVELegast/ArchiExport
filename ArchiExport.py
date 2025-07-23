@@ -1,11 +1,14 @@
+# TODO: Проблемы при повторном открытии модели
+
 import atexit
 import configparser
 import os
+import pathlib
 import xml
 
 import tkinter.filedialog
 from tkinter import ttk
-from tkinter.ttk import Treeview
+from tkinter.ttk import Treeview, Combobox
 from tkinter import Label, Button, BooleanVar, Checkbutton, Tk, N, W, E, S, NW, NE
 
 import xlsxwriter
@@ -13,8 +16,8 @@ import xlsxwriter
 import pandas as pd
 import xml.etree.ElementTree as ETree
 
-
 import constants
+from drawio import save_draw_io
 from storage import _ModelsDataStorage
 
 
@@ -78,6 +81,8 @@ def get_models_recursion(
                 item_list = []
                 rel_list = []
                 prop_list = []
+                item_graphic_list = []
+                relation_graphic_list = []
                 for element in item_xml.findall('child'):
                     if element.attrib['{http://www.w3.org/2001/XMLSchema-instance}type'] == 'archimate:DiagramObject':
                         object_id = element.attrib['archimateElement']
@@ -91,6 +96,23 @@ def get_models_recursion(
                                 'Type': object_list[object_id]['Type']
                             }
                             prop_list.append(attr_record)
+                        # Отдельно выделяем координаты и размеры объектов
+                        element_coord = element.find('bounds')
+                        if 'type' in element.attrib:
+                            icon = True
+                        else:
+                            icon = False
+                        if element_coord is not None:
+                            graphic_record = {
+                                'ID': element.get('id'),
+                                'object_ID': object_id,
+                                'X': element_coord.get('x'),
+                                'Y': element_coord.get('y'),
+                                'Width': element_coord.get('width'),
+                                'Height': element_coord.get('height'),
+                                'Icon': icon
+                            }
+                            item_graphic_list.append(graphic_record)
                     for relation in element.findall('sourceConnection'):
                         if 'archimateRelationship' in relation.attrib:
                             relation_id = relation.attrib['archimateRelationship']
@@ -104,10 +126,33 @@ def get_models_recursion(
                                     'Type': object_list[relation_id]['Type']
                                 }
                                 prop_list.append(attr_record)
+                            # Отдельно выделяем все необходимые координаты и подписи
+                            relation_bendpoints = []
+                            for relation_bendpoint in relation.findall('bendpoint'):
+                                bendpoint_record = {
+                                    'startX': relation_bendpoint.get('startX'),
+                                    'startY': relation_bendpoint.get('startY'),
+                                    'endX': relation_bendpoint.get('endX'),
+                                    'endY': relation_bendpoint.get('endY'),
+                                    'X': int(relation_bendpoint.get('startX') or 0) + int(element_coord.get('x') or 0)+ int(element_coord.get('width') or 0)/2,
+                                    'Y': int(relation_bendpoint.get('startY') or 0) + int(element_coord.get('y') or 0) + int(element_coord.get('height') or 0)/2,
+                                }
+                                relation_bendpoints.append(bendpoint_record)
+                            # TODO: Потенциально необходимо разобраться с тем, какие идентификаторы пишутся в конечный файл и собирать их
+                            relation_graphic_record = {
+                                'ID': relation.get('id'),
+                                'relation_ID': relation_id,
+                                'source_id': relation.get('source'),
+                                'target_id': relation.get('target'),
+                                'bendpoints': relation_bendpoints
+                            }
+                            relation_graphic_list.append(relation_graphic_record)
                 settings.new_model_content(
                     item_list=item_list,
                     relation_list=rel_list,
-                    property_list=prop_list
+                    property_list=prop_list,
+                    item_graph_list=item_graphic_list,
+                    relation_graph_list=relation_graphic_list
                 )
 
 
@@ -134,6 +179,11 @@ def get_models_list(file_name: str) -> str:
         properties_list = {}
         for element_xml in model_xml.findall('.//element'):
             object_type = element_xml.attrib['{http://www.w3.org/2001/XMLSchema-instance}type'][10:]
+            if object_type == 'Junction':
+                if 'type' in element_xml.attrib:
+                    object_type = 'JunctionOr'
+                else:
+                    object_type = 'JunctionAnd'
             object_name, object_profile, object_documentation = object_parsing(element_xml)
             object_list[element_xml.attrib['id']] = {
                 'ID': element_xml.attrib['id'],
@@ -189,7 +239,7 @@ def get_models_list(file_name: str) -> str:
 
 
 def file_dialog():
-    file_name = tkinter.filedialog.askopenfilename(filetypes=(('Arhi files', '*.archimate'), ('All files', '*.*')))
+    file_name = tkinter.filedialog.askopenfilename(filetypes=(('Arhi model', '*.archimate'), ('All files', '*.*')))
     if file_name != '':
         file_label.configure(text = file_name)
         for child in tree_box.get_children():
@@ -203,46 +253,57 @@ def save_dialog():
     relation_attributes = next((x for x in relations_check if x.id == 'Attributes'), None)
     source_attributes = next((x for x in relations_check if x.id == 'SourceAttributes'), None)
     target_attributes = next((x for x in relations_check if x.id == 'TargetAttributes'), None)
-    elements_df, relations_df, properties_df = settings.get_model_content(
-        selected_index,
-        element_attributes=element_attributes.get(),
-        relation_attributes=relation_attributes.get(),
-        source_attributes= source_attributes.get(),
-        target_attributes= target_attributes.get()
-    )
 
-
-    for check_item in elements_check:
-        if not check_item.get() and not check_item.id.find('attribute') == -1:
-            print(check_item.id)
-            elements_df.drop(check_item.id, axis=1, inplace=True)
-
-    for check_item in relations_check:
-        if not check_item.get() and not check_item.id.find('attribute') == -1:
-            relations_df.drop(check_item.id, axis=1, inplace=True)
+    file_type_desc = type_combo.get()
+    file_type_ext = type_dict[type_combo.get()]
 
     file_name = tkinter.filedialog.asksaveasfilename(
         initialfile=tree_box.item(selected_index)['text'],
         confirmoverwrite=True,
-        filetypes=(('Excel file', '*.xlsx'), ('All files', '*.*')),
-        defaultextension='.xlsx',
+        filetypes=((file_type_desc, '*'+file_type_ext), ('All files', '*.*')),
+        defaultextension=file_type_ext,
     )
+
     if file_name != '':
-        writer = pd.ExcelWriter(file_name, engine='xlsxwriter')
-        elements_df.to_excel(writer, index=False, sheet_name='elements')
-        relations_df.to_excel(writer, index=False, sheet_name='relations')
-        properties_df.to_excel(writer, index=False, sheet_name='properties')
-        writer.close()
-        if autorun_check.get():
-            os.system(f'start excel.exe "{file_name}"')
+        if pathlib.Path(file_name).suffix == '.xlsx':
+            elements_df, relations_df, properties_df = settings.get_model_content_excel(
+                selected_index,
+                element_attributes=element_attributes.get(),
+                relation_attributes=relation_attributes.get(),
+                source_attributes=source_attributes.get(),
+                target_attributes=target_attributes.get()
+            )
+            for check_item in elements_check:
+                if not check_item.get() and not check_item.id.find('attribute') == -1:
+                    elements_df.drop(check_item.id, axis=1, inplace=True)
+
+            for check_item in relations_check:
+                if not check_item.get() and not check_item.id.find('attribute') == -1:
+                    relations_df.drop(check_item.id, axis=1, inplace=True)
+
+            writer = pd.ExcelWriter(file_name, engine='xlsxwriter')
+            elements_df.to_excel(writer, index=False, sheet_name='elements')
+            relations_df.to_excel(writer, index=False, sheet_name='relations')
+            properties_df.to_excel(writer, index=False, sheet_name='properties')
+            writer.close()
+            if autorun_check.get():
+                os.system(f'start excel.exe "{file_name}"')
+        elif pathlib.Path(file_name).suffix == '.drawio':
+            elements_df, relations_df = settings.get_model_content_drawio(
+                selected_index
+            )
+            # Тут передаём вызов в подпрограмму записи
+            save_draw_io(file_name, elements_df, relations_df)
+        else:
+            print('Данный тип файла не обрабатывается!!!')
 
 
 def item_selected(event):
     selected_index = tree_box.selection()[0]
     if selected_index in settings.get_model_keys():
-        exel_btn['state'] = 'normal'
+        processing_btn['state'] = 'normal'
     else:
-        exel_btn['state'] = 'disabled'
+        processing_btn['state'] = 'disabled'
 
 
 def exit_handler():
@@ -293,14 +354,19 @@ if __name__ == '__main__':
     tree_box.column('#0')
     tree_box.bind('<<TreeviewSelect>>', item_selected)
     # - кнопка запуска обработки
-    exel_btn = Button(window, text='Обработать', command=save_dialog, font=constants.WINDOW_FONT)
-    exel_btn['state'] = 'disabled'
-    exel_btn.grid(column=0, row=buttons_len+2)
-    # Чек-бокс автозапуска
+    processing_btn = Button(window, text='Обработать', command=save_dialog, font=constants.WINDOW_FONT)
+    processing_btn['state'] = 'disabled'
+    processing_btn.grid(column=0, row=buttons_len + 2)
+    # Выбор типа обработки
+    type_dict = {'Excel report': '.xlsx', 'draw.io diagram': '.drawio'}
+    type_combo = Combobox(window, values=list(type_dict.keys()), state='readonly')
+    type_combo.set('Excel report')
+    type_combo.grid(column=1, row=buttons_len + 2)
+    # Чек-бокс автоматического запуска
     autorun_check = MyCheckBox(
         window,
         row=buttons_len+2,
-        column=1,
+        column=3,
         check_id='autorun',
         text='открыть файл после обработки',
         value=eval(config['Excel']['autorun'])
